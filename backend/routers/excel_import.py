@@ -1,9 +1,12 @@
-"""Excel bulk import — ingest raw Ninehire export and create clean candidate entries."""
+"""Excel/CSV bulk import — ingest raw Ninehire export or CSV and create candidate entries."""
+import csv
+import io
 import os
 import uuid
 import openpyxl
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from backend.config import UPLOAD_DIR
@@ -12,51 +15,21 @@ from backend.models import Candidate, Document
 
 router = APIRouter(prefix="/api/import", tags=["import"])
 
+NAME_KEYWORDS = ["회사", "브랜드", "기업", "업체", "상호", "이름", "name", "company"]
 
-@router.post("/excel")
-async def import_excel(
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-):
-    """Import candidates from a Ninehire Excel export.
-    Creates one Candidate per row, stores the raw data as a Document.
-    Returns a clean HTML summary view.
-    """
-    ext = os.path.splitext(file.filename or "")[1].lower().lstrip(".")
-    if ext not in ("xlsx", "xls"):
-        raise HTTPException(status_code=400, detail="엑셀 파일(.xlsx/.xls)만 지원합니다")
 
-    # Save file
-    unique_name = f"{uuid.uuid4().hex}_{file.filename}"
-    file_path = os.path.join(UPLOAD_DIR, unique_name)
-    content = await file.read()
-    with open(file_path, "wb") as f:
-        f.write(content)
-
-    # Parse
-    wb = openpyxl.load_workbook(file_path, data_only=True)
-    ws = wb.active
-    if not ws:
-        raise HTTPException(status_code=400, detail="시트를 읽을 수 없습니다")
-
-    rows = list(ws.iter_rows(values_only=True))
-    if len(rows) < 2:
-        raise HTTPException(status_code=400, detail="데이터가 없습니다")
-
-    headers = [str(h).strip() if h else f"열{i}" for i, h in enumerate(rows[0])]
-
-    # Try to find the name column
-    name_col = None
-    name_keywords = ["회사", "브랜드", "기업", "업체", "상호", "이름", "name", "company"]
+def _find_name_col(headers: list[str]) -> int:
     for i, h in enumerate(headers):
-        if any(kw in h.lower() for kw in name_keywords):
-            name_col = i
-            break
-    if name_col is None:
-        name_col = 0  # fallback to first column
+        if any(kw in h.lower() for kw in NAME_KEYWORDS):
+            return i
+    return 0
 
+
+def _import_rows(headers: list[str], rows: list, filename: str, file_path: str, file_type: str, db: Session) -> list[dict]:
+    name_col = _find_name_col(headers)
     imported = []
-    for row in rows[1:]:
+
+    for row in rows:
         if not row or not any(row):
             continue
 
@@ -64,15 +37,13 @@ async def import_excel(
         if name in ("None", ""):
             name = "이름 없음"
 
-        # Build extracted text from all columns
         row_data = {}
         for i, val in enumerate(row):
-            if val is not None:
-                row_data[headers[i]] = str(val)
+            if i < len(headers) and val is not None and str(val).strip():
+                row_data[headers[i]] = str(val).strip()
 
         extracted_text = "\n".join(f"{k}: {v}" for k, v in row_data.items())
 
-        # Check if candidate already exists
         existing = db.query(Candidate).filter(Candidate.name == name).first()
         if existing:
             candidate = existing
@@ -84,9 +55,9 @@ async def import_excel(
 
         doc = Document(
             candidate_id=candidate.id,
-            filename=file.filename or "excel_import.xlsx",
+            filename=filename,
             file_path=file_path,
-            file_type="xlsx",
+            file_type=file_type,
             extracted_text=extracted_text,
         )
         db.add(doc)
@@ -94,7 +65,36 @@ async def import_excel(
 
         imported.append({"id": candidate.id, "name": name, "data": row_data})
 
-    wb.close()
+    return imported
+
+
+@router.post("/excel")
+async def import_excel(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Import candidates from Excel or CSV."""
+    ext = os.path.splitext(file.filename or "")[1].lower().lstrip(".")
+    if ext not in ("xlsx", "xls", "csv"):
+        raise HTTPException(status_code=400, detail="엑셀(.xlsx/.xls) 또는 CSV(.csv) 파일만 지원합니다")
+
+    unique_name = f"{uuid.uuid4().hex}_{file.filename}"
+    file_path = os.path.join(UPLOAD_DIR, unique_name)
+    content = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    if ext == "csv":
+        headers, rows = _parse_csv(content)
+        file_type = "csv"
+    else:
+        headers, rows = _parse_excel(file_path)
+        file_type = "xlsx"
+
+    if len(rows) < 1:
+        raise HTTPException(status_code=400, detail="데이터가 없습니다")
+
+    imported = _import_rows(headers, rows, file.filename or f"import.{ext}", file_path, file_type, db)
 
     return {
         "message": f"{len(imported)}개 후보 가져오기 완료",
@@ -102,6 +102,90 @@ async def import_excel(
         "candidates": imported,
         "headers": headers,
     }
+
+
+class LocalImport(BaseModel):
+    file_path: str
+
+
+@router.post("/local")
+def import_local_file(data: LocalImport, db: Session = Depends(get_db)):
+    """Import from a local file path (called from Claude Code skill)."""
+    path = data.file_path.replace("\\", "/")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=400, detail=f"파일을 찾을 수 없습니다: {path}")
+
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    if ext not in ("xlsx", "xls", "csv"):
+        raise HTTPException(status_code=400, detail="엑셀(.xlsx/.xls) 또는 CSV(.csv) 파일만 지원합니다")
+
+    filename = os.path.basename(path)
+
+    if ext == "csv":
+        with open(path, "rb") as f:
+            content = f.read()
+        headers, rows = _parse_csv(content)
+        file_type = "csv"
+    else:
+        headers, rows = _parse_excel(path)
+        file_type = "xlsx"
+
+    if len(rows) < 1:
+        raise HTTPException(status_code=400, detail="데이터가 없습니다")
+
+    imported = _import_rows(headers, rows, filename, path, file_type, db)
+
+    return {
+        "message": f"{len(imported)}개 후보 가져오기 완료",
+        "count": len(imported),
+        "candidates": imported,
+        "headers": headers,
+    }
+
+
+def _parse_csv(content: bytes) -> tuple[list[str], list]:
+    """Parse CSV bytes, auto-detect encoding and delimiter."""
+    for encoding in ("utf-8-sig", "utf-8", "euc-kr", "cp949"):
+        try:
+            text = content.decode(encoding)
+            break
+        except (UnicodeDecodeError, ValueError):
+            continue
+    else:
+        text = content.decode("utf-8", errors="replace")
+
+    # Auto-detect delimiter
+    sniffer = csv.Sniffer()
+    try:
+        dialect = sniffer.sniff(text[:2000])
+    except csv.Error:
+        dialect = None
+
+    reader = csv.reader(io.StringIO(text), dialect or csv.excel)
+    all_rows = list(reader)
+    if len(all_rows) < 2:
+        return [], []
+
+    headers = [h.strip() if h else f"열{i}" for i, h in enumerate(all_rows[0])]
+    data_rows = all_rows[1:]
+    return headers, data_rows
+
+
+def _parse_excel(file_path: str) -> tuple[list[str], list]:
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+    ws = wb.active
+    if not ws:
+        wb.close()
+        return [], []
+
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+
+    if len(rows) < 2:
+        return [], []
+
+    headers = [str(h).strip() if h else f"열{i}" for i, h in enumerate(rows[0])]
+    return headers, rows[1:]
 
 
 @router.post("/excel/preview", response_class=HTMLResponse)
