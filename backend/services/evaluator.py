@@ -1,8 +1,14 @@
+"""Evaluation prompt builder and result writer.
+
+Evaluation itself runs via Claude Code skill (Max plan, $0 API cost).
+This module provides:
+- SYSTEM_PROMPT and prompt builder for the Claude Code Agent subagents
+- save_evaluation() to write results back to DB from the skill
+"""
+
 import json
-import anthropic
 from sqlalchemy.orm import Session
 
-from backend.config import ANTHROPIC_API_KEY, MODEL_NAME
 from backend.models import Candidate, Evaluation
 from backend.services.rubric import get_active_rubric
 
@@ -55,7 +61,7 @@ SYSTEM_PROMPT = """당신은 CJ온스타일 온큐베이팅(ONCUBATING) 프로�
   "synergy_with_portfolio": "<기존 온큐베이팅 선정 브랜드와의 시너지 분석 (2-3문장)>",
   "similar_selected_brands": ["유사 기선정 브랜드1", "유사 기선정 브랜드2"],
   "recommended_md_team": "뷰티|헬스푸드|글로벌",
-  "global_applicable": true/false
+  "global_applicable": true
 }"""
 
 
@@ -76,86 +82,65 @@ def build_evaluation_prompt(rubric: dict, document_text: str) -> str:
 위 서류를 분석하고 각 평가 항목별로 채점해주세요. JSON 형식으로만 응답하세요."""
 
 
-def evaluate_candidate(db: Session, candidate_id: int):
+def get_pending_candidates(db: Session) -> list[dict]:
+    """Get all candidates with status 'pending' that have documents."""
+    candidates = (
+        db.query(Candidate)
+        .filter(Candidate.status == "pending")
+        .all()
+    )
+    result = []
+    for c in candidates:
+        if c.documents:
+            doc_texts = []
+            for doc in c.documents:
+                if doc.extracted_text:
+                    doc_texts.append(f"=== {doc.filename} ({doc.file_type}) ===\n{doc.extracted_text}")
+            if doc_texts:
+                combined = "\n\n".join(doc_texts)
+                if len(combined) > 150000:
+                    combined = combined[:150000] + "\n\n[... 서류 내용 일부 생략]"
+                result.append({
+                    "id": c.id,
+                    "name": c.name,
+                    "document_text": combined,
+                })
+    return result
+
+
+def save_evaluation(db: Session, candidate_id: int, result_json: dict, rubric: dict):
+    """Save evaluation result from Claude Code skill back to DB."""
     candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
     if not candidate:
         return
 
-    candidate.status = "evaluating"
+    # Calculate overall score (skip global if 0)
+    total_score = 0
+    total_max = 0
+    for dim in rubric["dimensions"]:
+        dim_name = dim["name"]
+        if dim_name in result_json.get("scores", {}):
+            s = result_json["scores"][dim_name]
+            if "글로벌" in dim_name and s["score"] == 0:
+                continue
+            total_score += s["score"] * dim["weight"]
+            total_max += s["max"] * dim["weight"]
+
+    overall = round((total_score / total_max * 100) if total_max > 0 else 0, 1)
+
+    evaluation = Evaluation(
+        candidate_id=candidate_id,
+        rubric_id=rubric["id"],
+        overall_score=overall,
+        scores=result_json.get("scores", {}),
+        summary=result_json.get("summary", ""),
+        recommendation=result_json.get("recommendation", ""),
+        strengths=result_json.get("strengths", []),
+        risks=result_json.get("risks", []),
+        raw_response=json.dumps(result_json, ensure_ascii=False),
+        model_used="claude-code-max",
+        tokens_used=0,
+    )
+    db.add(evaluation)
+    candidate.status = "completed"
     db.commit()
-
-    try:
-        # Collect all document texts
-        doc_texts = []
-        for doc in candidate.documents:
-            if doc.extracted_text:
-                doc_texts.append(f"=== {doc.filename} ({doc.file_type}) ===\n{doc.extracted_text}")
-
-        if not doc_texts:
-            candidate.status = "error"
-            db.commit()
-            return
-
-        combined_text = "\n\n".join(doc_texts)
-        # Truncate if too long (keep ~150K chars)
-        if len(combined_text) > 150000:
-            combined_text = combined_text[:150000] + "\n\n[... 서류 내용이 너무 길어 일부 생략됨]"
-
-        rubric = get_active_rubric(db)
-        user_prompt = build_evaluation_prompt(rubric, combined_text)
-
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
-            model=MODEL_NAME,
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-
-        raw_text = response.content[0].text
-        # Strip markdown code fences if present
-        clean = raw_text.strip()
-        if clean.startswith("```"):
-            clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
-            if clean.endswith("```"):
-                clean = clean[:-3]
-            clean = clean.strip()
-
-        result = json.loads(clean)
-
-        # Calculate overall score (skip global dimension if score is 0 / not applicable)
-        total_score = 0
-        total_max = 0
-        for dim in rubric["dimensions"]:
-            dim_name = dim["name"]
-            if dim_name in result.get("scores", {}):
-                s = result["scores"][dim_name]
-                # If global dimension scored 0, exclude from weighted total
-                if "글로벌" in dim_name and s["score"] == 0:
-                    continue
-                total_score += s["score"] * dim["weight"]
-                total_max += s["max"] * dim["weight"]
-
-        overall = round((total_score / total_max * 100) if total_max > 0 else 0, 1)
-
-        evaluation = Evaluation(
-            candidate_id=candidate_id,
-            rubric_id=rubric["id"],
-            overall_score=overall,
-            scores=result.get("scores", {}),
-            summary=result.get("summary", ""),
-            recommendation=result.get("recommendation", ""),
-            strengths=result.get("strengths", []),
-            risks=result.get("risks", []),
-            raw_response=raw_text,
-            model_used=MODEL_NAME,
-            tokens_used=response.usage.input_tokens + response.usage.output_tokens,
-        )
-        db.add(evaluation)
-        candidate.status = "completed"
-        db.commit()
-
-    except Exception as e:
-        candidate.status = "error"
-        candidate.notes = (candidate.notes or "") + f"\n[평가 오류] {str(e)}"
-        db.commit()
